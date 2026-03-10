@@ -1,10 +1,11 @@
 import { useState, useCallback, useRef } from "react";
+import { Document, Packer, Paragraph, TextRun, HeadingLevel } from "docx";
 import { generateSampleDocs } from "./sampleDocs.js";
 
 const ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
 const API_URL = "/api/anthropic";
 
-// ─── DOCX parser (reads ZIP/XML directly in browser, no API needed) ───────────
+// ─── DOCX parser (reads ZIP/XML directly in browser) ─────────────────────────
 async function extractTextFromDocx(file) {
   const buffer = await new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -16,7 +17,6 @@ async function extractTextFromDocx(file) {
   const bytes = new Uint8Array(buffer);
   const dec = new TextDecoder("utf-8");
 
-  // Parse ZIP to find word/document.xml
   let i = 0;
   let xml = null;
   while (i < bytes.length - 4) {
@@ -41,7 +41,6 @@ async function extractTextFromDocx(file) {
 
   if (!xml) throw new Error(`Nie można odczytać ${file.name} — upewnij się że to poprawny plik .docx`);
 
-  // Extract text from <w:t> tags with paragraph breaks
   const paragraphs = xml.split(/<w:p[ >\/]/);
   return paragraphs.map(para => {
     const matches = [...para.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)];
@@ -71,171 +70,62 @@ async function mergeWithTemplate(templateText, targetText) {
   return data.content.find((b) => b.type === "text")?.text || "";
 }
 
-// ─── Minimal DOCX generator ───────────────────────────────────────────────────
-function textToDocx(text) {
+// ─── DOCX generator using docx library ───────────────────────────────────────
+async function createDocxBlob(text) {
   const lines = text.split("\n");
-  const ns = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
 
-  const paraXml = lines.map((line) => {
-    const escaped = line
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+  const children = lines.map(line => {
+    const clean = line.replace(/^#+\s*/, "").replace(/\*\*/g, "").trim();
 
-    const isBold = line.startsWith("##") || line.startsWith("**") ||
-      /^[A-ZŁÓŚĄĘŹŻĆŃ\s:]+$/.test(line.trim()) && line.trim().length > 3;
-
-    if (!line.trim()) return `<w:p><w:r><w:t></w:t></w:r></w:p>`;
-
-    const clean = escaped.replace(/^#+\s*/, "").replace(/\*\*/g, "");
-
-    if (isBold) {
-      return `<w:p>
-        <w:pPr><w:spacing w:before="200" w:after="60"/></w:pPr>
-        <w:r><w:rPr><w:b/><w:color w:val="1F3A8C"/><w:sz w:val="26"/></w:rPr>
-        <w:t xml:space="preserve">${clean}</w:t></w:r></w:p>`;
+    if (!clean) {
+      return new Paragraph({ text: "" });
     }
-    return `<w:p>
-      <w:pPr><w:spacing w:before="40" w:after="40"/></w:pPr>
-      <w:r><w:rPr><w:sz w:val="22"/></w:rPr>
-      <w:t xml:space="preserve">${clean}</w:t></w:r></w:p>`;
-  }).join("\n");
 
-  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document ${ns}
-  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <w:body>
-${paraXml}
-    <w:sectPr>
-      <w:pgSz w:w="11906" w:h="16838"/>
-      <w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1701"/>
-    </w:sectPr>
-  </w:body>
-</w:document>`;
+    // Detect headings: ALL CAPS lines or lines starting with ##
+    const isHeading = line.startsWith("##") || line.startsWith("# ") ||
+      (/^[A-ZŁÓŚĄĘŹŻĆŃ\s:\/\-]+$/.test(clean) && clean.length > 3 && clean.length < 80);
 
-  const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:styles ${ns}>
-  <w:docDefaults>
-    <w:rPrDefault><w:rPr>
-      <w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/>
-      <w:sz w:val="22"/>
-    </w:rPr></w:rPrDefault>
-  </w:docDefaults>
-  <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
-    <w:name w:val="Normal"/>
-  </w:style>
-</w:styles>`;
-
-  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
-</Types>`;
-
-  const appRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>`;
-
-  const wordRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
-</Relationships>`;
-
-  return { documentXml, stylesXml, contentTypes, appRels, wordRels };
-}
-
-// ─── Pure JS ZIP builder ──────────────────────────────────────────────────────
-function buildZip(files) {
-  const enc = new TextEncoder();
-  const crcTable = (() => {
-    const t = new Uint32Array(256);
-    for (let n = 0; n < 256; n++) {
-      let c = n;
-      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      t[n] = c;
+    if (isHeading) {
+      return new Paragraph({
+        children: [new TextRun({ text: clean, bold: true, color: "1F3A8C", size: 26 })],
+        spacing: { before: 200, after: 60 },
+      });
     }
-    return t;
-  })();
 
-  function crc32(data) {
-    let crc = 0xffffffff;
-    for (const b of data) crc = crcTable[(crc ^ b) & 0xff] ^ (crc >>> 8);
-    return (crc ^ 0xffffffff) >>> 0;
-  }
+    // Detect field: label lines ending with colon
+    const isLabel = /^[^:]+:\s*$/.test(clean) || /^[^:]+:\s+.+$/.test(clean);
 
-  function u16(v) { return [v & 0xff, (v >> 8) & 0xff]; }
-  function u32(v) { return [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >> 24) & 0xff]; }
+    if (isLabel) {
+      const colonIdx = clean.indexOf(":");
+      const label = clean.substring(0, colonIdx + 1);
+      const value = clean.substring(colonIdx + 1);
+      return new Paragraph({
+        children: [
+          new TextRun({ text: label, bold: true, size: 22 }),
+          new TextRun({ text: value, size: 22 }),
+        ],
+        spacing: { before: 40, after: 40 },
+      });
+    }
 
-  const localEntries = [];
-  const centralEntries = [];
-  let offset = 0;
-
-  for (const [name, content] of files) {
-    const nameBytes = enc.encode(name);
-    const data = typeof content === "string" ? enc.encode(content) : content;
-    const crc = crc32(data);
-
-    const local = new Uint8Array([
-      0x50, 0x4b, 0x03, 0x04,
-      ...u16(20), ...u16(0), ...u16(0),
-      ...u16(0), ...u16(0),
-      ...u32(crc), ...u32(data.length), ...u32(data.length),
-      ...u16(nameBytes.length), ...u16(0),
-      ...nameBytes,
-    ]);
-
-    localEntries.push({ local, data });
-
-    const central = new Uint8Array([
-      0x50, 0x4b, 0x01, 0x02,
-      ...u16(20), ...u16(20),
-      ...u16(0), ...u16(0), ...u16(0),
-      ...u16(0), ...u16(0),
-      ...u32(crc), ...u32(data.length), ...u32(data.length),
-      ...u16(nameBytes.length), ...u16(0), ...u16(0),
-      ...u16(0), ...u16(0), ...u32(0), ...u32(offset),
-      ...nameBytes,
-    ]);
-    centralEntries.push(central);
-    offset += local.length + data.length;
-  }
-
-  const cdSize = centralEntries.reduce((s, c) => s + c.length, 0);
-  const eocd = new Uint8Array([
-    0x50, 0x4b, 0x05, 0x06,
-    ...u16(0), ...u16(0),
-    ...u16(localEntries.length), ...u16(localEntries.length),
-    ...u32(cdSize), ...u32(offset), ...u16(0),
-  ]);
-
-  const parts = [];
-  localEntries.forEach(({ local, data }) => { parts.push(local); parts.push(data); });
-  centralEntries.forEach((c) => parts.push(c));
-  parts.push(eocd);
-
-  const total = parts.reduce((s, p) => s + p.length, 0);
-  const result = new Uint8Array(total);
-  let pos = 0;
-  for (const p of parts) { result.set(p, pos); pos += p.length; }
-  return result;
-}
-
-function createDocxBlob(mergedText) {
-  const { documentXml, stylesXml, contentTypes, appRels, wordRels } = textToDocx(mergedText);
-  const zip = buildZip([
-    ["[Content_Types].xml", contentTypes],
-    ["_rels/.rels", appRels],
-    ["word/document.xml", documentXml],
-    ["word/styles.xml", stylesXml],
-    ["word/_rels/document.xml.rels", wordRels],
-  ]);
-  return new Blob([zip], {
-    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    return new Paragraph({
+      children: [new TextRun({ text: clean, size: 22 })],
+      spacing: { before: 40, after: 40 },
+    });
   });
+
+  const doc = new Document({
+    sections: [{
+      properties: {
+        page: {
+          margin: { top: 1134, right: 1134, bottom: 1134, left: 1701 },
+        },
+      },
+      children,
+    }],
+  });
+
+  return await Packer.toBlob(doc);
 }
 
 // ─── Dropzone ─────────────────────────────────────────────────────────────────
@@ -321,11 +211,11 @@ export default function App() {
     setRunning(true); reset();
 
     try {
-      log("📂 Wczytuję i parsują template...");
+      log("📂 Wczytuję template...");
       const templateText = await extractTextFromDocx(templateFile);
       if (!templateText.trim()) throw new Error("Nie udało się odczytać tekstu z template'u");
 
-      log("📂 Wczytuję i parsują dokument kandydata...");
+      log("📂 Wczytuję dokument kandydata...");
       const targetText = await extractTextFromDocx(targetFile);
       if (!targetText.trim()) throw new Error("Nie udało się odczytać tekstu z dokumentu kandydata");
 
@@ -334,7 +224,7 @@ export default function App() {
       setPreview(merged);
 
       log("📦 Generuję plik DOCX...");
-      const blob = createDocxBlob(merged);
+      const blob = await createDocxBlob(merged);
       const name = `wypelniony_${templateFile.name.replace(/\.docx$/i, "")}_${Date.now()}.docx`;
       setResultBlob(blob); setResultName(name);
 
