@@ -2,6 +2,7 @@ import { useState, useCallback, useRef } from "react";
 import { generateSampleDocs } from "./sampleDocs.js";
 
 const ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
+const API_KEY = import.meta.env.VITE_ANTHROPIC_API_KEY;
 
 // ─── DOCX text extractor via Claude API ──────────────────────────────────────
 async function fileToBase64(file) {
@@ -18,12 +19,12 @@ async function fileToBase64(file) {
   });
 }
 
-async function extractTextFromDocx(base64, filename, apiKey) {
+async function extractTextFromDocx(base64, filename) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": apiKey,
+      "x-api-key": API_KEY,
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
@@ -42,10 +43,7 @@ async function extractTextFromDocx(base64, filename, apiKey) {
           },
           {
             type: "text",
-            text: `Wyciągnij CAŁĄ treść tekstową z tego dokumentu Word: "${filename}".
-Zwróć TYLKO surowy tekst, zachowując strukturę akapitów (nowe linie).
-Uwzględnij WSZYSTKO: nagłówki, etykiety pól, wartości, placeholdery.
-NIE streszczaj — wyciągaj dosłownie.`,
+            text: `Wyciągnij CAŁĄ treść tekstową z tego dokumentu Word: "${filename}".\nZwróć TYLKO surowy tekst, zachowując strukturę akapitów (nowe linie).\nUwzględnij WSZYSTKO: nagłówki, etykiety pól, wartości, placeholdery.\nNIE streszczaj — wyciągaj dosłownie.`,
           },
         ],
       }],
@@ -59,12 +57,12 @@ NIE streszczaj — wyciągaj dosłownie.`,
   return data.content.find((b) => b.type === "text")?.text || "";
 }
 
-async function mergeWithTemplate(templateText, targetText, apiKey) {
+async function mergeWithTemplate(templateText, targetText) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": apiKey,
+      "x-api-key": API_KEY,
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
@@ -72,26 +70,7 @@ async function mergeWithTemplate(templateText, targetText, apiKey) {
       max_tokens: 4000,
       messages: [{
         role: "user",
-        content: `Jesteś precyzyjnym agentem HR do wypełniania dokumentów.
-
-## TEMPLATE (wzór - struktura MUSI być zachowana w 100%):
-${templateText}
-
----
-
-## DOKUMENT ŹRÓDŁOWY (dane do przepisania):
-${targetText}
-
----
-
-INSTRUKCJE:
-1. Zachowaj CAŁĄ strukturę, nagłówki i stały tekst z TEMPLATE
-2. Znajdź odpowiedniki pól między dokumentami i przepisz wartości
-3. Pola bez odpowiednika pozostaw jako puste miejsce lub oryginalny placeholder
-4. NIE dodawaj nowych sekcji, NIE usuwaj istniejących
-5. NIE dodawaj komentarzy ani wyjaśnień
-
-Zwróć TYLKO wypełniony dokument zachowując strukturę template'u.`,
+        content: `Jesteś precyzyjnym agentem HR do wypełniania dokumentów.\n\n## TEMPLATE (wzór - struktura MUSI być zachowana w 100%):\n${templateText}\n\n---\n\n## DOKUMENT ŹRÓDŁOWY (dane do przepisania):\n${targetText}\n\n---\n\nINSTRUKCJE:\n1. Zachowaj CAŁĄ strukturę, nagłówki i stały tekst z TEMPLATE\n2. Znajdź odpowiedniki pól między dokumentami i przepisz wartości\n3. Pola bez odpowiednika pozostaw jako puste miejsce lub oryginalny placeholder\n4. NIE dodawaj nowych sekcji, NIE usuwaj istniejących\n5. NIE dodawaj komentarzy ani wyjaśnień\n\nZwróć TYLKO wypełniony dokument zachowując strukturę template'u.`,
       }],
     }),
   });
@@ -325,7 +304,6 @@ function Step({ n, label, active, done }) {
 export default function App() {
   const [templateFile, setTemplateFile] = useState(null);
   const [targetFile, setTargetFile] = useState(null);
-  const [apiKey, setApiKey] = useState("");
   const [logs, setLogs] = useState([]);
   const [running, setRunning] = useState(false);
   const [resultBlob, setResultBlob] = useState(null);
@@ -350,7 +328,11 @@ export default function App() {
   };
 
   const run = async () => {
-    if (!templateFile || !targetFile || !apiKey.trim()) return;
+    if (!templateFile || !targetFile) return;
+    if (!API_KEY) {
+      alert("Brak klucza API. Skontaktuj się z administratorem.");
+      return;
+    }
     setRunning(true); reset();
 
     try {
@@ -361,13 +343,13 @@ export default function App() {
       const targetB64 = await fileToBase64(targetFile);
 
       log("🔍 Claude analizuje template...");
-      const templateText = await extractTextFromDocx(templateB64, templateFile.name, apiKey);
+      const templateText = await extractTextFromDocx(templateB64, templateFile.name);
 
       log("🔍 Claude analizuje dokument kandydata...");
-      const targetText = await extractTextFromDocx(targetB64, targetFile.name, apiKey);
+      const targetText = await extractTextFromDocx(targetB64, targetFile.name);
 
       log("✍️  Claude przepisuje dane do template'u...");
-      const merged = await mergeWithTemplate(templateText, targetText, apiKey);
+      const merged = await mergeWithTemplate(templateText, targetText);
       setPreview(merged);
 
       log("📦 Generuję plik DOCX...");
@@ -385,9 +367,8 @@ export default function App() {
 
   const step1Done = !!templateFile;
   const step2Done = !!targetFile;
-  const step3Done = !!apiKey.trim();
-  const canRun = step1Done && step2Done && step3Done && !running;
-  const activeStep = !step1Done ? 1 : !step2Done ? 2 : !step3Done ? 3 : running ? 4 : resultBlob ? 5 : 4;
+  const canRun = step1Done && step2Done && !running;
+  const activeStep = !step1Done ? 1 : !step2Done ? 2 : running ? 3 : resultBlob ? 4 : 3;
 
   return (
     <div style={{ minHeight: "100vh", background: "#070b14", color: "#e2e8f0", fontFamily: "'Segoe UI', system-ui, sans-serif" }}>
@@ -405,16 +386,14 @@ export default function App() {
       </header>
 
       <div style={{ maxWidth: 860, margin: "0 auto", padding: "32px 24px" }}>
-        {/* Steps sidebar + content */}
         <div style={{ display: "flex", gap: 28 }}>
           {/* Steps */}
           <div style={{ display: "flex", flexDirection: "column", gap: 16, paddingTop: 4, minWidth: 180 }}>
             <div style={{ fontSize: 10, fontWeight: 700, color: "#334155", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 4 }}>Kroki</div>
             <Step n={1} label="Wgraj template" active={activeStep === 1} done={step1Done} />
             <Step n={2} label="Wgraj dokument" active={activeStep === 2} done={step2Done} />
-            <Step n={3} label="Podaj API key" active={activeStep === 3} done={step3Done} />
-            <Step n={4} label="Uruchom agenta" active={activeStep === 4} done={!!resultBlob} />
-            <Step n={5} label="Pobierz wynik" active={activeStep === 5} done={false} />
+            <Step n={3} label="Uruchom agenta" active={activeStep === 3} done={!!resultBlob} />
+            <Step n={4} label="Pobierz wynik" active={activeStep === 4} done={false} />
 
             <div style={{ marginTop: 16, padding: "12px", background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b" }}>
               <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.08em" }}>Jak to działa</div>
@@ -433,21 +412,6 @@ export default function App() {
                 <Dropzone label="Template / Wzór" tag="WZÓR" color="#6366f1" file={templateFile} onFile={(f) => { setTemplateFile(f); reset(); }} />
                 <Dropzone label="Dokument z danymi" tag="DANE" color="#f59e0b" file={targetFile} onFile={(f) => { setTargetFile(f); reset(); }} />
               </div>
-            </div>
-
-            {/* API Key */}
-            <div>
-              <div style={{ fontSize: 11, fontWeight: 700, color: "#475569", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 8 }}>
-                Anthropic API Key
-                <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer" style={{ marginLeft: 8, fontSize: 10, color: "#6366f1", textDecoration: "none" }}>uzyskaj klucz →</a>
-              </div>
-              <input
-                type="password"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="sk-ant-api..."
-                style={{ width: "100%", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: "10px 14px", color: "#e2e8f0", fontSize: 13, fontFamily: "monospace", outline: "none", boxSizing: "border-box" }}
-              />
             </div>
 
             {/* Flow arrow */}
