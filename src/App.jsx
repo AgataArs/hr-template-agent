@@ -2,7 +2,7 @@ import { useState, useCallback, useRef } from "react";
 import { generateSampleDocs } from "./sampleDocs.js";
 
 const ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
-const API_KEY = import.meta.env.VITE_ANTHROPIC_API_KEY;
+const API_URL = "/api/anthropic";
 
 // ─── DOCX text extractor via Claude API ──────────────────────────────────────
 async function fileToBase64(file) {
@@ -20,12 +20,10 @@ async function fileToBase64(file) {
 }
 
 async function extractTextFromDocx(base64, filename) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch(API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": API_KEY,
-      "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
       model: ANTHROPIC_MODEL,
@@ -58,12 +56,10 @@ async function extractTextFromDocx(base64, filename) {
 }
 
 async function mergeWithTemplate(templateText, targetText) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch(API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": API_KEY,
-      "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
       model: ANTHROPIC_MODEL,
@@ -329,10 +325,6 @@ export default function App() {
 
   const run = async () => {
     if (!templateFile || !targetFile) return;
-    if (!API_KEY) {
-      alert("Brak klucza API. Skontaktuj się z administratorem.");
-      return;
-    }
     setRunning(true); reset();
 
     try {
