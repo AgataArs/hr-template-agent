@@ -4,63 +4,56 @@ import { generateSampleDocs } from "./sampleDocs.js";
 const ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
 const API_URL = "/api/anthropic";
 
-// ─── DOCX text extractor via Claude API ──────────────────────────────────────
-async function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
+// ─── DOCX parser (reads ZIP/XML directly in browser, no API needed) ───────────
+async function extractTextFromDocx(file) {
+  const buffer = await new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = (e) => {
-      const bytes = new Uint8Array(e.target.result);
-      let binary = "";
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-      resolve(btoa(binary));
-    };
+    reader.onload = (e) => resolve(e.target.result);
     reader.onerror = reject;
     reader.readAsArrayBuffer(file);
   });
-}
 
-async function extractTextFromDocx(base64, filename) {
-  const res = await fetch(API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
-      max_tokens: 4000,
-      messages: [{
-        role: "user",
-        content: [
-          {
-            type: "document",
-            source: {
-              type: "base64",
-              media_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-              data: base64,
-            },
-          },
-          {
-            type: "text",
-            text: `Wyciągnij CAŁĄ treść tekstową z tego dokumentu Word: "${filename}".\nZwróć TYLKO surowy tekst, zachowując strukturę akapitów (nowe linie).\nUwzględnij WSZYSTKO: nagłówki, etykiety pól, wartości, placeholdery.\nNIE streszczaj — wyciągaj dosłownie.`,
-          },
-        ],
-      }],
-    }),
-  });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error?.message || `HTTP ${res.status}`);
+  const bytes = new Uint8Array(buffer);
+  const dec = new TextDecoder("utf-8");
+
+  // Parse ZIP to find word/document.xml
+  let i = 0;
+  let xml = null;
+  while (i < bytes.length - 4) {
+    if (bytes[i] === 0x50 && bytes[i+1] === 0x4b && bytes[i+2] === 0x03 && bytes[i+3] === 0x04) {
+      const nameLen = bytes[i+26] | (bytes[i+27] << 8);
+      const extraLen = bytes[i+28] | (bytes[i+29] << 8);
+      const compSize = bytes[i+18] | (bytes[i+19] << 8) | (bytes[i+20] << 16) | (bytes[i+21] << 24);
+      const compression = bytes[i+8] | (bytes[i+9] << 8);
+      const nameStart = i + 30;
+      const name = dec.decode(bytes.slice(nameStart, nameStart + nameLen));
+      const dataStart = nameStart + nameLen + extraLen;
+
+      if (name === "word/document.xml" && compression === 0) {
+        xml = dec.decode(bytes.slice(dataStart, dataStart + compSize));
+        break;
+      }
+      i = dataStart + Math.max(compSize, 1);
+    } else {
+      i++;
+    }
   }
-  const data = await res.json();
-  return data.content.find((b) => b.type === "text")?.text || "";
+
+  if (!xml) throw new Error(`Nie można odczytać ${file.name} — upewnij się że to poprawny plik .docx`);
+
+  // Extract text from <w:t> tags with paragraph breaks
+  const paragraphs = xml.split(/<w:p[ >\/]/);
+  return paragraphs.map(para => {
+    const matches = [...para.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)];
+    return matches.map(m => m[1]).join("");
+  }).filter(t => t.trim()).join("\n");
 }
 
+// ─── Merge via Claude API ─────────────────────────────────────────────────────
 async function mergeWithTemplate(templateText, targetText) {
   const res = await fetch(API_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: ANTHROPIC_MODEL,
       max_tokens: 4000,
@@ -328,17 +321,13 @@ export default function App() {
     setRunning(true); reset();
 
     try {
-      log("📂 Wczytuję template...");
-      const templateB64 = await fileToBase64(templateFile);
+      log("📂 Wczytuję i parsują template...");
+      const templateText = await extractTextFromDocx(templateFile);
+      if (!templateText.trim()) throw new Error("Nie udało się odczytać tekstu z template'u");
 
-      log("📂 Wczytuję dokument kandydata...");
-      const targetB64 = await fileToBase64(targetFile);
-
-      log("🔍 Claude analizuje template...");
-      const templateText = await extractTextFromDocx(templateB64, templateFile.name);
-
-      log("🔍 Claude analizuje dokument kandydata...");
-      const targetText = await extractTextFromDocx(targetB64, targetFile.name);
+      log("📂 Wczytuję i parsują dokument kandydata...");
+      const targetText = await extractTextFromDocx(targetFile);
+      if (!targetText.trim()) throw new Error("Nie udało się odczytać tekstu z dokumentu kandydata");
 
       log("✍️  Claude przepisuje dane do template'u...");
       const merged = await mergeWithTemplate(templateText, targetText);
@@ -364,7 +353,6 @@ export default function App() {
 
   return (
     <div style={{ minHeight: "100vh", background: "#070b14", color: "#e2e8f0", fontFamily: "'Segoe UI', system-ui, sans-serif" }}>
-      {/* Header */}
       <header style={{ borderBottom: "1px solid #0f172a", background: "#0a0f1e", padding: "0 32px", display: "flex", alignItems: "center", height: 60, gap: 12 }}>
         <div style={{ width: 36, height: 36, borderRadius: 8, background: "linear-gradient(135deg,#6366f1,#8b5cf6)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>📋</div>
         <div>
@@ -379,7 +367,6 @@ export default function App() {
 
       <div style={{ maxWidth: 860, margin: "0 auto", padding: "32px 24px" }}>
         <div style={{ display: "flex", gap: 28 }}>
-          {/* Steps */}
           <div style={{ display: "flex", flexDirection: "column", gap: 16, paddingTop: 4, minWidth: 180 }}>
             <div style={{ fontSize: 10, fontWeight: 700, color: "#334155", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 4 }}>Kroki</div>
             <Step n={1} label="Wgraj template" active={activeStep === 1} done={step1Done} />
@@ -395,9 +382,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Main content */}
           <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 20 }}>
-            {/* Dropzones */}
             <div>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#475569", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 12 }}>Dokumenty (.docx)</div>
               <div style={{ display: "flex", gap: 14 }}>
@@ -406,7 +391,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Flow arrow */}
             <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 12, color: "#334155" }}>
               <span style={{ padding: "3px 10px", background: "#0f172a", borderRadius: 20, color: "#818cf8" }}>🗂️ Template</span>
               <span style={{ color: "#1e293b" }}>+</span>
@@ -417,7 +401,6 @@ export default function App() {
               <span style={{ padding: "3px 10px", background: "rgba(99,102,241,0.15)", borderRadius: 20, color: "#a5b4fc" }}>✅ Gotowy dok.</span>
             </div>
 
-            {/* Run button */}
             <button
               onClick={run}
               disabled={!canRun}
@@ -437,7 +420,6 @@ export default function App() {
               {running ? "⚙️ Agent pracuje..." : "🚀 Uruchom Agenta"}
             </button>
 
-            {/* Log output */}
             {logs.length > 0 && (
               <div style={{ background: "#060b14", border: "1px solid #0f172a", borderRadius: 10, padding: 14, fontFamily: "monospace", fontSize: 12, maxHeight: 200, overflowY: "auto" }}>
                 {logs.map((l, i) => (
@@ -450,7 +432,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Result */}
             {resultBlob && (
               <div style={{ background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.25)", borderRadius: 10, padding: "16px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
                 <div>
@@ -472,7 +453,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Preview */}
             {showPreview && preview && (
               <div style={{ background: "#0a0f1e", border: "1px solid #0f172a", borderRadius: 10, padding: 20, maxHeight: 380, overflowY: "auto", fontSize: 13, lineHeight: 1.75, whiteSpace: "pre-wrap", color: "#cbd5e1" }}>
                 {preview}
@@ -483,8 +463,6 @@ export default function App() {
       </div>
 
       <style>{`
-        @keyframes spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
-        input:focus { border-color: #6366f1 !important; }
         *, *::before, *::after { box-sizing: border-box; }
         body { margin: 0; }
         ::-webkit-scrollbar { width: 6px; }
