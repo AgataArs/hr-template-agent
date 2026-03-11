@@ -1,12 +1,12 @@
 import { useState, useCallback, useRef } from "react";
-import { Document, Packer, Paragraph, TextRun, HeadingLevel } from "docx";
+import { Document, Packer, Paragraph, TextRun } from "docx";
 import { generateSampleDocs } from "./sampleDocs.js";
 
 const ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
 const API_URL = "/api/anthropic";
 
-// ─── DOCX parser (reads ZIP/XML directly in browser) ─────────────────────────
-async function extractTextFromDocx(file) {
+// ─── ZIP parser — obsługuje store (0) i deflate (8) ──────────────────────────
+async function parseDocxFiles(file) {
   const buffer = await new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => resolve(e.target.result);
@@ -16,39 +16,76 @@ async function extractTextFromDocx(file) {
 
   const bytes = new Uint8Array(buffer);
   const dec = new TextDecoder("utf-8");
-
+  const files = {};
   let i = 0;
-  let xml = null;
-  while (i < bytes.length - 4) {
-    if (bytes[i] === 0x50 && bytes[i+1] === 0x4b && bytes[i+2] === 0x03 && bytes[i+3] === 0x04) {
-      const nameLen = bytes[i+26] | (bytes[i+27] << 8);
-      const extraLen = bytes[i+28] | (bytes[i+29] << 8);
-      const compSize = bytes[i+18] | (bytes[i+19] << 8) | (bytes[i+20] << 16) | (bytes[i+21] << 24);
-      const compression = bytes[i+8] | (bytes[i+9] << 8);
-      const nameStart = i + 30;
-      const name = dec.decode(bytes.slice(nameStart, nameStart + nameLen));
-      const dataStart = nameStart + nameLen + extraLen;
 
-      if (name === "word/document.xml" && compression === 0) {
-        xml = dec.decode(bytes.slice(dataStart, dataStart + compSize));
-        break;
+  // Dynamically import pako for deflate decompression
+  let inflate;
+  try {
+    const pako = await import("https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.esm.mjs");
+    inflate = pako.inflateRaw;
+  } catch {
+    inflate = null;
+  }
+
+  while (i < bytes.length - 4) {
+    // Local file header signature: PK\x03\x04
+    if (bytes[i] === 0x50 && bytes[i+1] === 0x4b && bytes[i+2] === 0x03 && bytes[i+3] === 0x04) {
+      const compression = bytes[i+8]  | (bytes[i+9]  << 8);
+      const compSize    = bytes[i+18] | (bytes[i+19] << 8) | (bytes[i+20] << 16) | (bytes[i+21] << 24);
+      const uncompSize  = bytes[i+22] | (bytes[i+23] << 8) | (bytes[i+24] << 16) | (bytes[i+25] << 24);
+      const nameLen     = bytes[i+26] | (bytes[i+27] << 8);
+      const extraLen    = bytes[i+28] | (bytes[i+29] << 8);
+      const nameStart   = i + 30;
+      const name        = dec.decode(bytes.slice(nameStart, nameStart + nameLen));
+      const dataStart   = nameStart + nameLen + extraLen;
+      const compData    = bytes.slice(dataStart, dataStart + compSize);
+
+      let fileData = null;
+      if (compression === 0) {
+        // STORE — no compression
+        fileData = compData;
+      } else if (compression === 8 && inflate) {
+        // DEFLATE
+        try { fileData = inflate(compData); } catch { fileData = compData; }
+      } else {
+        fileData = compData;
       }
+
+      files[name] = fileData;
       i = dataStart + Math.max(compSize, 1);
     } else {
       i++;
     }
   }
 
-  if (!xml) throw new Error(`Nie można odczytać ${file.name} — upewnij się że to poprawny plik .docx`);
+  if (Object.keys(files).length === 0) {
+    throw new Error(`Nie można odczytać pliku ${file.name} — upewnij się że to poprawny plik .docx`);
+  }
 
-  const paragraphs = xml.split(/<w:p[ >\/]/);
-  return paragraphs.map(para => {
-    const matches = [...para.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)];
-    return matches.map(m => m[1]).join("");
-  }).filter(t => t.trim()).join("\n");
+  return files;
 }
 
-// ─── Merge via Claude API ─────────────────────────────────────────────────────
+function xmlToText(xmlBytes) {
+  const dec = new TextDecoder("utf-8");
+  const xml = dec.decode(xmlBytes);
+  const paragraphs = xml.split(/<w:p[ >\/]/);
+  return paragraphs
+    .map(para => [...para.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)].map(m => m[1]).join(""))
+    .filter(t => t.trim())
+    .join("\n");
+}
+
+// ─── Tryb 1: Przepisanie danych do template'u (Claude AI) ────────────────────
+async function extractTextFromDocx(file) {
+  const files = await parseDocxFiles(file);
+  const docXml = files["word/document.xml"];
+  if (!docXml) throw new Error(`Brak word/document.xml w pliku ${file.name}`);
+  const text = xmlToText(docXml);
+  if (!text.trim()) throw new Error(`Nie udało się odczytać tekstu z ${file.name} — plik może być pusty lub zaszyfrowany`);
+  return text;
+}
+
 async function mergeWithTemplate(templateText, targetText) {
   const res = await fetch(API_URL, {
     method: "POST",
@@ -63,51 +100,36 @@ async function mergeWithTemplate(templateText, targetText) {
     }),
   });
   if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error?.message || `HTTP ${res.status}`);
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error?.message || `Błąd API: HTTP ${res.status}`);
   }
   const data = await res.json();
-  return data.content.find((b) => b.type === "text")?.text || "";
+  return data.content?.find(b => b.type === "text")?.text || "";
 }
 
-// ─── DOCX generator using docx library ───────────────────────────────────────
-async function createDocxBlob(text) {
+async function createDocxFromText(text) {
   const lines = text.split("\n");
-
   const children = lines.map(line => {
     const clean = line.replace(/^#+\s*/, "").replace(/\*\*/g, "").trim();
-
-    if (!clean) {
-      return new Paragraph({ text: "" });
-    }
-
-    // Detect headings: ALL CAPS lines or lines starting with ##
+    if (!clean) return new Paragraph({ text: "" });
     const isHeading = line.startsWith("##") || line.startsWith("# ") ||
       (/^[A-ZŁÓŚĄĘŹŻĆŃ\s:\/\-]+$/.test(clean) && clean.length > 3 && clean.length < 80);
-
     if (isHeading) {
       return new Paragraph({
         children: [new TextRun({ text: clean, bold: true, color: "1F3A8C", size: 26 })],
         spacing: { before: 200, after: 60 },
       });
     }
-
-    // Detect field: label lines ending with colon
-    const isLabel = /^[^:]+:\s*$/.test(clean) || /^[^:]+:\s+.+$/.test(clean);
-
-    if (isLabel) {
-      const colonIdx = clean.indexOf(":");
-      const label = clean.substring(0, colonIdx + 1);
-      const value = clean.substring(colonIdx + 1);
+    const colonIdx = clean.indexOf(":");
+    if (colonIdx > 0 && colonIdx < clean.length - 1) {
       return new Paragraph({
         children: [
-          new TextRun({ text: label, bold: true, size: 22 }),
-          new TextRun({ text: value, size: 22 }),
+          new TextRun({ text: clean.substring(0, colonIdx + 1), bold: true, size: 22 }),
+          new TextRun({ text: clean.substring(colonIdx + 1), size: 22 }),
         ],
         spacing: { before: 40, after: 40 },
       });
     }
-
     return new Paragraph({
       children: [new TextRun({ text: clean, size: 22 })],
       spacing: { before: 40, after: 40 },
@@ -116,23 +138,174 @@ async function createDocxBlob(text) {
 
   const doc = new Document({
     sections: [{
-      properties: {
-        page: {
-          margin: { top: 1134, right: 1134, bottom: 1134, left: 1701 },
-        },
-      },
+      properties: { page: { margin: { top: 1134, right: 1134, bottom: 1134, left: 1701 } } },
       children,
     }],
   });
-
   return await Packer.toBlob(doc);
 }
 
-// ─── Dropzone ─────────────────────────────────────────────────────────────────
-function Dropzone({ label, tag, color, file, onFile }) {
+// ─── Tryb 2: Wstaw treść do layoutu HR (pure XML merge) ──────────────────────
+function buildDocxFromFiles(filesMap) {
+  const enc = new TextEncoder();
+
+  const crcTable = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c;
+    }
+    return t;
+  })();
+
+  function crc32(data) {
+    let crc = 0xFFFFFFFF;
+    for (const b of data) crc = crcTable[(crc ^ b) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  function u16(v) { return [(v) & 0xFF, (v >> 8) & 0xFF]; }
+  function u32(v) { return [(v) & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]; }
+
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+
+  for (const [name, content] of Object.entries(filesMap)) {
+    const nameBytes = enc.encode(name);
+    const data = content instanceof Uint8Array ? content : enc.encode(
+      typeof content === "string" ? content : new TextDecoder().decode(content)
+    );
+    const crc = crc32(data);
+
+    const local = new Uint8Array([
+      0x50, 0x4b, 0x03, 0x04,
+      ...u16(20), ...u16(0), ...u16(0),
+      ...u16(0), ...u16(0),
+      ...u32(crc), ...u32(data.length), ...u32(data.length),
+      ...u16(nameBytes.length), ...u16(0),
+      ...nameBytes,
+    ]);
+
+    const central = new Uint8Array([
+      0x50, 0x4b, 0x01, 0x02,
+      ...u16(20), ...u16(20),
+      ...u16(0), ...u16(0), ...u16(0),
+      ...u16(0), ...u16(0),
+      ...u32(crc), ...u32(data.length), ...u32(data.length),
+      ...u16(nameBytes.length), ...u16(0), ...u16(0),
+      ...u16(0), ...u16(0), ...u32(0), ...u32(offset),
+      ...nameBytes,
+    ]);
+
+    locals.push({ local, data });
+    centrals.push(central);
+    offset += local.length + data.length;
+  }
+
+  const cdSize = centrals.reduce((s, c) => s + c.length, 0);
+  const eocd = new Uint8Array([
+    0x50, 0x4b, 0x05, 0x06,
+    ...u16(0), ...u16(0),
+    ...u16(locals.length), ...u16(locals.length),
+    ...u32(cdSize), ...u32(offset), ...u16(0),
+  ]);
+
+  const parts = [];
+  locals.forEach(({ local, data }) => { parts.push(local); parts.push(data); });
+  centrals.forEach(c => parts.push(c));
+  parts.push(eocd);
+
+  const total = parts.reduce((s, p) => s + p.length, 0);
+  const result = new Uint8Array(total);
+  let pos = 0;
+  for (const p of parts) { result.set(p, pos); pos += p.length; }
+  return new Blob([result], {
+    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  });
+}
+
+async function injectContentIntoLayout(contentFile, layoutFile) {
+  const [contentFiles, layoutFiles] = await Promise.all([
+    parseDocxFiles(contentFile),
+    parseDocxFiles(layoutFile),
+  ]);
+
+  const dec = new TextDecoder("utf-8");
+
+  // Get content document body
+  const contentDocXml = contentFiles["word/document.xml"];
+  if (!contentDocXml) throw new Error(`Brak word/document.xml w pliku ${contentFile.name}`);
+
+  const contentXmlStr = dec.decode(contentDocXml);
+
+  // Extract body content (between <w:body> and last <w:sectPr>)
+  const bodyContentMatch = contentXmlStr.match(/<w:body>([\s\S]*?)<w:sectPr[\s>]/);
+  const bodyContent = bodyContentMatch ? bodyContentMatch[1] : "";
+
+  if (!bodyContent.trim()) {
+    throw new Error(`Nie znaleziono treści w ${contentFile.name}`);
+  }
+
+  // Get layout document.xml
+  const layoutDocXml = layoutFiles["word/document.xml"];
+  if (!layoutDocXml) throw new Error(`Brak word/document.xml w pliku ${layoutFile.name}`);
+
+  let layoutXmlStr = dec.decode(layoutDocXml);
+
+  // Inject content body before the layout's sectPr (which contains header/footer refs)
+  // Find the last <w:sectPr to preserve layout page settings
+  const sectPrIdx = layoutXmlStr.lastIndexOf("<w:sectPr");
+  if (sectPrIdx === -1) {
+    throw new Error("Nie znaleziono sekcji strony w layoucie HR");
+  }
+
+  // Build merged document.xml:
+  // layout body start + content body + layout sectPr (with headers/footers)
+  const mergedXml =
+    layoutXmlStr.substring(0, sectPrIdx) +
+    bodyContent +
+    layoutXmlStr.substring(sectPrIdx);
+
+  // Start with all layout files (headers, footers, images, styles, etc.)
+  const merged = { ...layoutFiles };
+
+  // Override document.xml with merged content
+  merged["word/document.xml"] = new TextEncoder().encode(mergedXml);
+
+  return buildDocxFromFiles(merged);
+}
+
+// ─── UI Components ────────────────────────────────────────────────────────────
+function ModeToggle({ mode, onChange }) {
+  return (
+    <div style={{ display: "flex", gap: 0, background: "#0f172a", borderRadius: 10, padding: 4, border: "1px solid #1e293b", marginBottom: 24 }}>
+      {[
+        { id: "merge", label: "🔀 Przepisz dane do template'u", desc: "Claude wypełnia wzór danymi" },
+        { id: "layout", label: "🎨 Wstaw treść do layoutu HR", desc: "Zachowuje nagłówek, stopkę, logo" },
+      ].map(m => (
+        <button
+          key={m.id}
+          onClick={() => onChange(m.id)}
+          style={{
+            flex: 1, padding: "10px 16px", borderRadius: 8, border: "none",
+            background: mode === m.id ? "linear-gradient(135deg,#6366f1,#8b5cf6)" : "transparent",
+            color: mode === m.id ? "#fff" : "#475569",
+            cursor: "pointer", transition: "all 0.2s", textAlign: "left",
+          }}
+        >
+          <div style={{ fontWeight: 700, fontSize: 13 }}>{m.label}</div>
+          <div style={{ fontSize: 11, opacity: 0.7, marginTop: 2 }}>{m.desc}</div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Dropzone({ label, tag, color, file, onFile, accept = ".docx" }) {
   const [over, setOver] = useState(false);
   const ref = useRef();
-
   return (
     <div
       onClick={() => ref.current?.click()}
@@ -140,19 +313,14 @@ function Dropzone({ label, tag, color, file, onFile }) {
       onDragLeave={() => setOver(false)}
       onDrop={(e) => { e.preventDefault(); setOver(false); const f = e.dataTransfer.files[0]; if (f) onFile(f); }}
       style={{
-        flex: 1,
-        border: `2px dashed ${over ? color : file ? "#22c55e" : "#2d3748"}`,
-        borderRadius: 12,
-        padding: "24px 16px",
-        cursor: "pointer",
+        flex: 1, border: `2px dashed ${over ? color : file ? "#22c55e" : "#2d3748"}`,
+        borderRadius: 12, padding: "24px 16px", cursor: "pointer",
         background: over ? `${color}11` : file ? "#22c55e11" : "#ffffff04",
-        transition: "all 0.18s",
-        textAlign: "center",
-        minWidth: 0,
+        transition: "all 0.18s", textAlign: "center", minWidth: 0,
       }}
     >
-      <input ref={ref} type="file" accept=".docx" hidden onChange={(e) => e.target.files[0] && onFile(e.target.files[0])} />
-      <div style={{ fontSize: 28, marginBottom: 8 }}>{file ? "✅" : tag === "WZÓR" ? "🗂️" : "📝"}</div>
+      <input ref={ref} type="file" accept={accept} hidden onChange={(e) => e.target.files[0] && onFile(e.target.files[0])} />
+      <div style={{ fontSize: 28, marginBottom: 8 }}>{file ? "✅" : tag === "WZÓR" || tag === "LAYOUT" ? "🗂️" : "📝"}</div>
       <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.1em", color: file ? "#22c55e" : color, fontFamily: "monospace", marginBottom: 4 }}>{tag}</div>
       <div style={{ fontSize: 12, fontWeight: 600, color: "#9ca3af" }}>{label}</div>
       {file
@@ -162,7 +330,6 @@ function Dropzone({ label, tag, color, file, onFile }) {
   );
 }
 
-// ─── Step indicator ───────────────────────────────────────────────────────────
 function Step({ n, label, active, done }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -171,8 +338,7 @@ function Step({ n, label, active, done }) {
         background: done ? "#22c55e" : active ? "#6366f1" : "#1f2937",
         color: done || active ? "#fff" : "#4b5563",
         display: "flex", alignItems: "center", justifyContent: "center",
-        fontSize: 12, fontWeight: 700, flexShrink: 0,
-        transition: "all 0.3s",
+        fontSize: 12, fontWeight: 700, flexShrink: 0, transition: "all 0.3s",
       }}>{done ? "✓" : n}</div>
       <span style={{ fontSize: 12, color: done ? "#22c55e" : active ? "#a5b4fc" : "#4b5563" }}>{label}</span>
     </div>
@@ -181,8 +347,16 @@ function Step({ n, label, active, done }) {
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
+  const [mode, setMode] = useState("merge");
+
+  // Merge mode state
   const [templateFile, setTemplateFile] = useState(null);
   const [targetFile, setTargetFile] = useState(null);
+
+  // Layout mode state
+  const [contentFile, setContentFile] = useState(null);
+  const [layoutFile, setLayoutFile] = useState(null);
+
   const [logs, setLogs] = useState([]);
   const [running, setRunning] = useState(false);
   const [resultBlob, setResultBlob] = useState(null);
@@ -192,11 +366,16 @@ export default function App() {
   const logsEndRef = useRef();
 
   const log = useCallback((msg, type = "info") => {
-    setLogs((prev) => [...prev, { msg, type, t: new Date().toLocaleTimeString("pl-PL") }]);
+    setLogs(prev => [...prev, { msg, type, t: new Date().toLocaleTimeString("pl-PL") }]);
     setTimeout(() => logsEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
   }, []);
 
   const reset = () => { setResultBlob(null); setLogs([]); setPreview(""); setShowPreview(false); };
+
+  const handleModeChange = (m) => {
+    setMode(m);
+    reset();
+  };
 
   const downloadSamples = () => {
     const { templateBlob, targetBlob } = generateSampleDocs();
@@ -206,29 +385,26 @@ export default function App() {
     }, 500);
   };
 
-  const run = async () => {
+  const runMerge = async () => {
     if (!templateFile || !targetFile) return;
     setRunning(true); reset();
-
     try {
-      log("📂 Wczytuję template...");
+      log("📂 Wczytuję i parsuję template...");
       const templateText = await extractTextFromDocx(templateFile);
-      if (!templateText.trim()) throw new Error("Nie udało się odczytać tekstu z template'u");
 
-      log("📂 Wczytuję dokument kandydata...");
+      log("📂 Wczytuję i parsuję dokument kandydata...");
       const targetText = await extractTextFromDocx(targetFile);
-      if (!targetText.trim()) throw new Error("Nie udało się odczytać tekstu z dokumentu kandydata");
 
       log("✍️  Claude przepisuje dane do template'u...");
       const merged = await mergeWithTemplate(templateText, targetText);
+      if (!merged.trim()) throw new Error("Claude zwrócił pusty dokument — spróbuj ponownie");
       setPreview(merged);
 
       log("📦 Generuję plik DOCX...");
-      const blob = await createDocxBlob(merged);
+      const blob = await createDocxFromText(merged);
       const name = `wypelniony_${templateFile.name.replace(/\.docx$/i, "")}_${Date.now()}.docx`;
       setResultBlob(blob); setResultName(name);
-
-      log("✅ Gotowe! Plik jest gotowy do pobrania.", "success");
+      log("✅ Gotowe!", "success");
     } catch (err) {
       log(`❌ Błąd: ${err.message}`, "error");
     } finally {
@@ -236,10 +412,35 @@ export default function App() {
     }
   };
 
-  const step1Done = !!templateFile;
-  const step2Done = !!targetFile;
-  const canRun = step1Done && step2Done && !running;
-  const activeStep = !step1Done ? 1 : !step2Done ? 2 : running ? 3 : resultBlob ? 4 : 3;
+  const runLayout = async () => {
+    if (!contentFile || !layoutFile) return;
+    setRunning(true); reset();
+    try {
+      log("📂 Wczytuję plik z treścią...");
+      log("🎨 Wczytuję layout HR...");
+
+      const blob = await injectContentIntoLayout(contentFile, layoutFile);
+
+      const name = `${contentFile.name.replace(/\.docx$/i, "")}_layout_HR.docx`;
+      setResultBlob(blob); setResultName(name);
+      log("✅ Gotowe! Treść wstawiona do layoutu HR.", "success");
+    } catch (err) {
+      log(`❌ Błąd: ${err.message}`, "error");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  // Steps for each mode
+  const isMerge = mode === "merge";
+  const file1 = isMerge ? templateFile : contentFile;
+  const file2 = isMerge ? targetFile : layoutFile;
+  const canRun = file1 && file2 && !running;
+  const activeStep = !file1 ? 1 : !file2 ? 2 : running ? 3 : resultBlob ? 4 : 3;
+
+  const steps = isMerge
+    ? ["Wgraj template (wzór)", "Wgraj dokument z danymi", "Uruchom agenta", "Pobierz wynik"]
+    : ["Wgraj dokument z treścią", "Wgraj layout HR", "Połącz dokumenty", "Pobierz wynik"];
 
   return (
     <div style={{ minHeight: "100vh", background: "#070b14", color: "#e2e8f0", fontFamily: "'Segoe UI', system-ui, sans-serif" }}>
@@ -247,69 +448,109 @@ export default function App() {
         <div style={{ width: 36, height: 36, borderRadius: 8, background: "linear-gradient(135deg,#6366f1,#8b5cf6)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>📋</div>
         <div>
           <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "-0.3px" }}>HR Template Agent</div>
-          <div style={{ fontSize: 11, color: "#475569" }}>Powered by Claude AI · Przepisuje dane do wzorów dokumentów</div>
+          <div style={{ fontSize: 11, color: "#475569" }}>Powered by Claude AI · Automatyzacja dokumentów HR</div>
         </div>
         <div style={{ flex: 1 }} />
-        <button onClick={downloadSamples} style={{ padding: "7px 14px", borderRadius: 8, border: "1px solid #1e3a5f", background: "rgba(99,102,241,0.1)", color: "#818cf8", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>
-          ⬇️ Pobierz przykładowe dokumenty
-        </button>
+        {isMerge && (
+          <button onClick={downloadSamples} style={{ padding: "7px 14px", borderRadius: 8, border: "1px solid #1e3a5f", background: "rgba(99,102,241,0.1)", color: "#818cf8", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>
+            ⬇️ Pobierz przykładowe dokumenty
+          </button>
+        )}
       </header>
 
-      <div style={{ maxWidth: 860, margin: "0 auto", padding: "32px 24px" }}>
-        <div style={{ display: "flex", gap: 28 }}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 16, paddingTop: 4, minWidth: 180 }}>
-            <div style={{ fontSize: 10, fontWeight: 700, color: "#334155", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 4 }}>Kroki</div>
-            <Step n={1} label="Wgraj template" active={activeStep === 1} done={step1Done} />
-            <Step n={2} label="Wgraj dokument" active={activeStep === 2} done={step2Done} />
-            <Step n={3} label="Uruchom agenta" active={activeStep === 3} done={!!resultBlob} />
-            <Step n={4} label="Pobierz wynik" active={activeStep === 4} done={false} />
+      <div style={{ maxWidth: 900, margin: "0 auto", padding: "32px 24px" }}>
+        <ModeToggle mode={mode} onChange={handleModeChange} />
 
-            <div style={{ marginTop: 16, padding: "12px", background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b" }}>
-              <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.08em" }}>Jak to działa</div>
+        <div style={{ display: "flex", gap: 28 }}>
+          {/* Steps sidebar */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 16, paddingTop: 4, minWidth: 190 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: "#334155", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 4 }}>Kroki</div>
+            {steps.map((label, idx) => (
+              <Step key={idx} n={idx + 1} label={label} active={activeStep === idx + 1} done={
+                idx === 0 ? !!file1 :
+                idx === 1 ? !!file2 :
+                idx === 2 ? !!resultBlob :
+                false
+              } />
+            ))}
+
+            <div style={{ marginTop: 16, padding: 12, background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b" }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                {isMerge ? "Jak to działa" : "ℹ️ Ten tryb"}
+              </div>
               <div style={{ fontSize: 11, color: "#64748b", lineHeight: 1.6 }}>
-                Claude czyta oba dokumenty, identyfikuje pola i przepisuje dane zachowując strukturę template'u.
+                {isMerge
+                  ? "Claude czyta oba dokumenty, identyfikuje pola i przepisuje dane zachowując strukturę template'u."
+                  : "Treść dokumentu zostaje wstawiona do layoutu HR — zachowany jest oryginalny nagłówek, stopka, logo i style strony."}
               </div>
             </div>
           </div>
 
+          {/* Main content */}
           <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 20 }}>
             <div>
-              <div style={{ fontSize: 11, fontWeight: 700, color: "#475569", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 12 }}>Dokumenty (.docx)</div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#475569", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 12 }}>
+                {isMerge ? "Dokumenty (.docx)" : "Pliki do połączenia (.docx)"}
+              </div>
               <div style={{ display: "flex", gap: 14 }}>
-                <Dropzone label="Template / Wzór" tag="WZÓR" color="#6366f1" file={templateFile} onFile={(f) => { setTemplateFile(f); reset(); }} />
-                <Dropzone label="Dokument z danymi" tag="DANE" color="#f59e0b" file={targetFile} onFile={(f) => { setTargetFile(f); reset(); }} />
+                {isMerge ? (
+                  <>
+                    <Dropzone label="Template / Wzór" tag="WZÓR" color="#6366f1" file={templateFile} onFile={(f) => { setTemplateFile(f); reset(); }} />
+                    <Dropzone label="Dokument z danymi" tag="DANE" color="#f59e0b" file={targetFile} onFile={(f) => { setTargetFile(f); reset(); }} />
+                  </>
+                ) : (
+                  <>
+                    <Dropzone label="Dokument z treścią" tag="TREŚĆ" color="#f59e0b" file={contentFile} onFile={(f) => { setContentFile(f); reset(); }} />
+                    <Dropzone label="Layout HR (nagłówek/stopka)" tag="LAYOUT" color="#6366f1" file={layoutFile} onFile={(f) => { setLayoutFile(f); reset(); }} />
+                  </>
+                )}
               </div>
             </div>
 
+            {/* Flow visualization */}
             <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 12, color: "#334155" }}>
-              <span style={{ padding: "3px 10px", background: "#0f172a", borderRadius: 20, color: "#818cf8" }}>🗂️ Template</span>
-              <span style={{ color: "#1e293b" }}>+</span>
-              <span style={{ padding: "3px 10px", background: "#0f172a", borderRadius: 20, color: "#fbbf24" }}>📝 Dane</span>
-              <span>→</span>
-              <span style={{ color: "#6366f1", fontWeight: 600 }}>🤖 Claude</span>
-              <span>→</span>
-              <span style={{ padding: "3px 10px", background: "rgba(99,102,241,0.15)", borderRadius: 20, color: "#a5b4fc" }}>✅ Gotowy dok.</span>
+              {isMerge ? (
+                <>
+                  <span style={{ padding: "3px 10px", background: "#0f172a", borderRadius: 20, color: "#818cf8" }}>🗂️ Template</span>
+                  <span>+</span>
+                  <span style={{ padding: "3px 10px", background: "#0f172a", borderRadius: 20, color: "#fbbf24" }}>📝 Dane</span>
+                  <span>→</span>
+                  <span style={{ color: "#6366f1", fontWeight: 600 }}>🤖 Claude</span>
+                  <span>→</span>
+                  <span style={{ padding: "3px 10px", background: "rgba(99,102,241,0.15)", borderRadius: 20, color: "#a5b4fc" }}>✅ Wypełniony dok.</span>
+                </>
+              ) : (
+                <>
+                  <span style={{ padding: "3px 10px", background: "#0f172a", borderRadius: 20, color: "#fbbf24" }}>📝 Treść</span>
+                  <span>+</span>
+                  <span style={{ padding: "3px 10px", background: "#0f172a", borderRadius: 20, color: "#818cf8" }}>🎨 Layout HR</span>
+                  <span>→</span>
+                  <span style={{ color: "#6366f1", fontWeight: 600 }}>⚙️ Merge XML</span>
+                  <span>→</span>
+                  <span style={{ padding: "3px 10px", background: "rgba(99,102,241,0.15)", borderRadius: 20, color: "#a5b4fc" }}>✅ Dok. w layoucie HR</span>
+                </>
+              )}
             </div>
 
+            {/* Run button */}
             <button
-              onClick={run}
+              onClick={isMerge ? runMerge : runLayout}
               disabled={!canRun}
               style={{
-                padding: "13px 20px",
-                borderRadius: 10,
-                border: "none",
+                padding: "13px 20px", borderRadius: 10, border: "none",
                 background: canRun ? "linear-gradient(135deg,#6366f1,#8b5cf6)" : "#0f172a",
                 color: canRun ? "#fff" : "#334155",
-                fontSize: 14,
-                fontWeight: 700,
+                fontSize: 14, fontWeight: 700,
                 cursor: canRun ? "pointer" : "not-allowed",
-                letterSpacing: "-0.2px",
                 transition: "all 0.2s",
               }}
             >
-              {running ? "⚙️ Agent pracuje..." : "🚀 Uruchom Agenta"}
+              {running
+                ? (isMerge ? "⚙️ Claude pracuje..." : "⚙️ Łączę dokumenty...")
+                : (isMerge ? "🚀 Uruchom Agenta" : "🎨 Połącz z layoutem HR")}
             </button>
 
+            {/* Logs */}
             {logs.length > 0 && (
               <div style={{ background: "#060b14", border: "1px solid #0f172a", borderRadius: 10, padding: 14, fontFamily: "monospace", fontSize: 12, maxHeight: 200, overflowY: "auto" }}>
                 {logs.map((l, i) => (
@@ -322,6 +563,7 @@ export default function App() {
               </div>
             )}
 
+            {/* Result */}
             {resultBlob && (
               <div style={{ background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.25)", borderRadius: 10, padding: "16px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
                 <div>
@@ -329,9 +571,11 @@ export default function App() {
                   <div style={{ fontSize: 11, color: "#475569", fontFamily: "monospace", marginTop: 2 }}>{resultName}</div>
                 </div>
                 <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <button onClick={() => setShowPreview(!showPreview)} style={{ padding: "7px 14px", borderRadius: 7, border: "1px solid #1e293b", background: "transparent", color: "#64748b", fontSize: 12, cursor: "pointer" }}>
-                    {showPreview ? "Ukryj podgląd" : "Podgląd tekstu"}
-                  </button>
+                  {isMerge && (
+                    <button onClick={() => setShowPreview(!showPreview)} style={{ padding: "7px 14px", borderRadius: 7, border: "1px solid #1e293b", background: "transparent", color: "#64748b", fontSize: 12, cursor: "pointer" }}>
+                      {showPreview ? "Ukryj podgląd" : "Podgląd tekstu"}
+                    </button>
+                  )}
                   <a
                     href={URL.createObjectURL(resultBlob)}
                     download={resultName}
