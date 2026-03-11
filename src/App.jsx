@@ -145,136 +145,47 @@ async function createDocxFromText(text) {
   return await Packer.toBlob(doc);
 }
 
-// ─── Tryb 2: Wstaw treść do layoutu HR (pure XML merge) ──────────────────────
-function buildDocxFromFiles(filesMap) {
-  const enc = new TextEncoder();
-
-  const crcTable = (() => {
-    const t = new Uint32Array(256);
-    for (let n = 0; n < 256; n++) {
-      let c = n;
-      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-      t[n] = c;
-    }
-    return t;
-  })();
-
-  function crc32(data) {
-    let crc = 0xFFFFFFFF;
-    for (const b of data) crc = crcTable[(crc ^ b) & 0xFF] ^ (crc >>> 8);
-    return (crc ^ 0xFFFFFFFF) >>> 0;
-  }
-
-  function u16(v) { return [(v) & 0xFF, (v >> 8) & 0xFF]; }
-  function u32(v) { return [(v) & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]; }
-
-  const locals = [];
-  const centrals = [];
-  let offset = 0;
-
-  for (const [name, content] of Object.entries(filesMap)) {
-    const nameBytes = enc.encode(name);
-    const data = content instanceof Uint8Array ? content : enc.encode(
-      typeof content === "string" ? content : new TextDecoder().decode(content)
-    );
-    const crc = crc32(data);
-
-    const local = new Uint8Array([
-      0x50, 0x4b, 0x03, 0x04,
-      ...u16(20), ...u16(0), ...u16(0),
-      ...u16(0), ...u16(0),
-      ...u32(crc), ...u32(data.length), ...u32(data.length),
-      ...u16(nameBytes.length), ...u16(0),
-      ...nameBytes,
-    ]);
-
-    const central = new Uint8Array([
-      0x50, 0x4b, 0x01, 0x02,
-      ...u16(20), ...u16(20),
-      ...u16(0), ...u16(0), ...u16(0),
-      ...u16(0), ...u16(0),
-      ...u32(crc), ...u32(data.length), ...u32(data.length),
-      ...u16(nameBytes.length), ...u16(0), ...u16(0),
-      ...u16(0), ...u16(0), ...u32(0), ...u32(offset),
-      ...nameBytes,
-    ]);
-
-    locals.push({ local, data });
-    centrals.push(central);
-    offset += local.length + data.length;
-  }
-
-  const cdSize = centrals.reduce((s, c) => s + c.length, 0);
-  const eocd = new Uint8Array([
-    0x50, 0x4b, 0x05, 0x06,
-    ...u16(0), ...u16(0),
-    ...u16(locals.length), ...u16(locals.length),
-    ...u32(cdSize), ...u32(offset), ...u16(0),
-  ]);
-
-  const parts = [];
-  locals.forEach(({ local, data }) => { parts.push(local); parts.push(data); });
-  centrals.forEach(c => parts.push(c));
-  parts.push(eocd);
-
-  const total = parts.reduce((s, p) => s + p.length, 0);
-  const result = new Uint8Array(total);
-  let pos = 0;
-  for (const p of parts) { result.set(p, pos); pos += p.length; }
-  return new Blob([result], {
-    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+// ─── Tryb 2: Wstaw treść do layoutu HR (backend JSZip) ───────────────────────
+async function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const bytes = new Uint8Array(e.target.result);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      resolve(btoa(binary));
+    };
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
   });
 }
 
 async function injectContentIntoLayout(contentFile, layoutFile) {
-  const [contentFiles, layoutFiles] = await Promise.all([
-    parseDocxFiles(contentFile),
-    parseDocxFiles(layoutFile),
+  const [contentBase64, layoutBase64] = await Promise.all([
+    fileToBase64(contentFile),
+    fileToBase64(layoutFile),
   ]);
 
-  const dec = new TextDecoder("utf-8");
+  const res = await fetch("/api/merge-layout", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contentBase64, layoutBase64 }),
+  });
 
-  // Get content document body
-  const contentDocXml = contentFiles["word/document.xml"];
-  if (!contentDocXml) throw new Error(`Brak word/document.xml w pliku ${contentFile.name}`);
-
-  const contentXmlStr = dec.decode(contentDocXml);
-
-  // Extract body content (between <w:body> and last <w:sectPr>)
-  const bodyContentMatch = contentXmlStr.match(/<w:body>([\s\S]*?)<w:sectPr[\s>]/);
-  const bodyContent = bodyContentMatch ? bodyContentMatch[1] : "";
-
-  if (!bodyContent.trim()) {
-    throw new Error(`Nie znaleziono treści w ${contentFile.name}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Błąd serwera: HTTP ${res.status}`);
   }
 
-  // Get layout document.xml
-  const layoutDocXml = layoutFiles["word/document.xml"];
-  if (!layoutDocXml) throw new Error(`Brak word/document.xml w pliku ${layoutFile.name}`);
+  const { docxBase64 } = await res.json();
+  if (!docxBase64) throw new Error("Serwer nie zwrócił pliku DOCX");
 
-  let layoutXmlStr = dec.decode(layoutDocXml);
-
-  // Inject content body before the layout's sectPr (which contains header/footer refs)
-  // Find the last <w:sectPr to preserve layout page settings
-  const sectPrIdx = layoutXmlStr.lastIndexOf("<w:sectPr");
-  if (sectPrIdx === -1) {
-    throw new Error("Nie znaleziono sekcji strony w layoucie HR");
-  }
-
-  // Build merged document.xml:
-  // layout body start + content body + layout sectPr (with headers/footers)
-  const mergedXml =
-    layoutXmlStr.substring(0, sectPrIdx) +
-    bodyContent +
-    layoutXmlStr.substring(sectPrIdx);
-
-  // Start with all layout files (headers, footers, images, styles, etc.)
-  const merged = { ...layoutFiles };
-
-  // Override document.xml with merged content
-  merged["word/document.xml"] = new TextEncoder().encode(mergedXml);
-
-  return buildDocxFromFiles(merged);
+  const binary = atob(docxBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], {
+    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
 }
 
 // ─── UI Components ────────────────────────────────────────────────────────────
