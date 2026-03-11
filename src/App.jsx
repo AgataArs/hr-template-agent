@@ -150,13 +150,12 @@ async function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
-      const bytes = new Uint8Array(e.target.result);
-      let binary = "";
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-      resolve(btoa(binary));
+      // readAsDataURL zwraca "data:...;base64,XXXX" — odcinamy prefix
+      const base64 = e.target.result.split(",")[1];
+      resolve(base64);
     };
     reader.onerror = reject;
-    reader.readAsArrayBuffer(file);
+    reader.readAsDataURL(file);
   });
 }
 
